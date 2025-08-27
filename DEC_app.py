@@ -7,9 +7,8 @@ from openpyxl import load_workbook  #import openpyxl to edit existing workbook
 #-----------------------------
 #Streamlit UI
 #-----------------------------
-st.set_page_config(page_title="CPI – Modality Averages", page_icon="page", layout="wide")  #set page
-st.title("Daily/Weekly/Monthly/Quarterly/Yearly Calculator")  #title
-
+st.set_page_config(page_title="CPI – Modality Tables", page_icon="page", layout="wide")  #set page
+st.title("Daily/Weekly/Monthly/Quarterly/Yearly Tables")  #title
 uploaded_file = st.file_uploader("Upload the Excel file", type=["xlsx"])  #file uploader
 
 #-----------------------------
@@ -20,212 +19,182 @@ def _norm_text(x:str)->str:  #normalize a header cell
     s = re.sub(r"\s+"," ", s)  #collapse spaces
     return s
 
-def _period_to_ts(s: pd.Series, freq: str) -> pd.Series:  #convert period strings to timestamps
-    p = pd.PeriodIndex(s.astype(str), freq=freq)
-    return p.to_timestamp()
+def _period_to_ts(s: pd.Series, freq: str) -> pd.Series:  #period string→timestamp
+    p = pd.PeriodIndex(s.astype(str), freq=freq)  #period index
+    return p.to_timestamp()  #start-of-period timestamp
 
 def _sniff_header(df: pd.DataFrame, look_for=("room", "study date")):  #find header row index
-    max_scan = min(10, len(df))
-    targets = set([_norm_text(t) for t in look_for])
-    for i in range(max_scan):
+    max_scan = min(10, len(df))  #scan first 10 rows
+    targets = set([_norm_text(t) for t in look_for])  #normalize targets
+    for i in range(max_scan):  #check each candidate row
         row_norm = [_norm_text(v) for v in df.iloc[i].tolist()]
         if all(any(t == c for c in row_norm) for t in targets):
             return i
-    return None
+    return None  #not found
 
-def _read_sheet_robust(src_bytes: BytesIO, sheet_name: str):  #read a sheet with unknown header row
-    src_bytes.seek(0)
-    raw = pd.read_excel(src_bytes, sheet_name=sheet_name, header=None, dtype=str)
+def _read_sheet_robust(src_bytes: BytesIO, sheet_name: str):  #read sheet with unknown header row
+    src_bytes.seek(0)  #rewind
+    raw = pd.read_excel(src_bytes, sheet_name=sheet_name, header=None, dtype=str)  #raw read
     if raw.empty:
-        return None, None, None
-    hdr_idx = _sniff_header(raw, ("room","study date"))  #prefer exact
+        return None, None, None  #empty
+    hdr_idx = _sniff_header(raw, ("room","study date"))  #try exact
     if hdr_idx is None:  #fallback: accept any “study” + “room”
         hdr_idx = _sniff_header(raw, ("room","study"))
     if hdr_idx is None:
-        return raw, None, None
-    headers = raw.iloc[hdr_idx].apply(lambda x: str(x).replace("\xa0"," ").strip())
-    df = raw.iloc[hdr_idx+1:].reset_index(drop=True)
-    df.columns = headers
-    #detect columns with robust matching
-    cols_norm = { _norm_text(c): c for c in df.columns }
-    room_col = cols_norm.get("room")
-    study_col = cols_norm.get("study date")
+        return raw, None, None  #no header found
+    headers = raw.iloc[hdr_idx].apply(lambda x: str(x).replace("\xa0"," ").strip())  #clean headers
+    df = raw.iloc[hdr_idx+1:].reset_index(drop=True)  #data below header
+    df.columns = headers  #assign headers
+
+    cols_norm = { _norm_text(c): c for c in df.columns }  #normalized map
+    room_col = cols_norm.get("room")  #room column
+    study_col = cols_norm.get("study date")  #study date column
     if not room_col:
-        #fallback partial for room
         for c in df.columns:
             if "room" in _norm_text(c):
                 room_col = c; break
     if not study_col:
-        #fallback partial for study date/time variants
         for c in df.columns:
             n = _norm_text(c)
             if ("study" in n and "date" in n) or n in ("studydate","study datetime","study date/time"):
                 study_col = c; break
-    return df, room_col, study_col
+    return df, room_col, study_col  #return cleaned df and column names
+
+def make_wide_table(long_df: pd.DataFrame, index_col: str, period_name: str)->pd.DataFrame:  #long→wide
+    pivot = long_df.pivot_table(index=index_col, columns="Room", values="Volume", aggfunc="sum").fillna(0)  #pivot
+    pivot["Total Exams"] = pivot.sum(axis=1)  #total column
+    pivot = pivot.sort_index()  #sort by index
+    pivot.index.name = period_name  #label index
+    out = pivot.reset_index()  #back to columns
+    return out  #wide table
+
+def add_pct_change_table(wide_df: pd.DataFrame, period_col: str)->pd.DataFrame:  #add % change columns
+    df = wide_df.copy()  #copy
+    pct = df[[c for c in df.columns if c != period_col]].pct_change().round(4)  #pct change
+    pct.insert(0, period_col, df[period_col])  #keep period column
+    #rename columns with suffix
+    pct.columns = [period_col] + [f"{c} %Δ" for c in df.columns if c != period_col]  #suffix
+    return pct  #table of % change
 
 #-----------------------------
-#Processing
+#Main processing
 #-----------------------------
-if uploaded_file:
-    src_bytes = BytesIO(uploaded_file.read())  #read upload
-    src_bytes.seek(0)
-    xls = pd.ExcelFile(src_bytes)
-    sheet_names = xls.sheet_names
+if uploaded_file:  #run when file present
+    src_bytes = BytesIO(uploaded_file.read())  #read upload into memory
+    src_bytes.seek(0)  #rewind
+    xls = pd.ExcelFile(src_bytes)  #inspect workbook
+    sheet_names = xls.sheet_names  #all sheet names
 
-    results = {}
-    modality_days = {"US": 4}  #ultrasound 4 days/week
-    default_days = 5  #others 5 days/week
+    results = {}  #collect per-sheet outputs
 
-    for sname in sheet_names:
-        df, room_col, date_col = _read_sheet_robust(src_bytes, sname)
+    for sname in sheet_names:  #loop sheets
+        df, room_col, date_col = _read_sheet_robust(src_bytes, sname)  #robust read
         if df is None or df.empty:
-            st.warning(f"sheet '{sname}': empty or unreadable — skipping")
-            continue
+            st.warning(f"sheet '{sname}': empty or unreadable — skipping")  #warn
+            continue  #next
         if not room_col or not date_col:
-            st.warning(f"sheet '{sname}': couldn't find Room/Study Date — skipping. columns seen: {list(df.columns)[:8]}...")
-            continue
+            st.warning(f"sheet '{sname}': couldn't find Room/Study Date — skipping. sample columns: {list(df.columns)[:8]}")  #warn
+            continue  #next
 
-        work = df.copy()
-        work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
-        work = work.dropna(subset=[date_col])
+        work = df.copy()  #copy
+        work[date_col] = pd.to_datetime(work[date_col], errors="coerce")  #to datetime
+        work = work.dropna(subset=[date_col])  #drop bad dates
         if work.empty:
-            st.warning(f"sheet '{sname}': no valid Study Date values — skipping")
-            continue
+            st.warning(f"sheet '{sname}': no valid Study Date values — skipping")  #warn
+            continue  #next
 
-        work["Volume"] = 1
-        work["StudyDate"] = work[date_col].dt.date
+        work["Volume"] = 1  #each row counts as one exam
+        work["Room"] = work[room_col].astype(str).str.strip()  #normalize room
+        work["StudyDate"] = work[date_col].dt.date  #pure date
 
-        daily = work.groupby([room_col, "StudyDate"], as_index=False)["Volume"].sum()
-        daily["Week"] = pd.to_datetime(daily["StudyDate"]).dt.to_period("W-MON")
-        weekly = daily.groupby([room_col, "Week"], as_index=False)["Volume"].sum()
-        daily["Month"] = pd.to_datetime(daily["StudyDate"]).dt.to_period("M")
-        monthly = daily.groupby([room_col, "Month"], as_index=False)["Volume"].sum()
-        daily["Quarter"] = pd.to_datetime(daily["StudyDate"]).dt.to_period("Q")
-        quarterly = daily.groupby([room_col, "Quarter"], as_index=False)["Volume"].sum()
-        daily["Year"] = pd.to_datetime(daily["StudyDate"]).dt.to_period("Y")
-        yearly = daily.groupby([room_col, "Year"], as_index=False)["Volume"].sum()
+        daily_long = work.groupby(["Room","StudyDate"], as_index=False)["Volume"].sum()  #daily long
+        daily_wide = make_wide_table(daily_long, "StudyDate", "Date")  #daily wide
 
-        rows = []
-        for room in daily[room_col].astype(str).unique():
-            d_per_wk = modality_days.get(room, default_days)
-            dsub = daily[daily[room_col].astype(str) == room]
-            avg_day = dsub["Volume"].mean()
-            avg_week_total = dsub.groupby("Week")["Volume"].sum().mean()
-            avg_week_per_day = (avg_week_total / d_per_wk) if d_per_wk else None
-            avg_month = dsub.groupby("Month")["Volume"].sum().mean()
-            avg_quarter = dsub.groupby("Quarter")["Volume"].sum().mean()
-            avg_year = dsub.groupby("Year")["Volume"].sum().mean()
-            rows.append([room, avg_day, avg_week_per_day, avg_month, avg_quarter, avg_year])
+        daily_long["Week"] = pd.to_datetime(daily_long["StudyDate"]).dt.to_period("W-MON")  #week period
+        weekly_long = daily_long.groupby(["Room","Week"], as_index=False)["Volume"].sum()  #weekly long
+        weekly_wide = make_wide_table(weekly_long, "Week", "Week")  #weekly wide
 
-        averages = pd.DataFrame(
-            rows,
-            columns=["Room","Avg/Day","Avg/Week(per scheduled day)","Avg/Month","Avg/Quarter","Avg/Year"]
-        )
+        daily_long["Month"] = pd.to_datetime(daily_long["StudyDate"]).dt.to_period("M")  #month period
+        monthly_long = daily_long.groupby(["Room","Month"], as_index=False)["Volume"].sum()  #monthly long
+        monthly_wide = make_wide_table(monthly_long, "Month", "Month")  #monthly wide
+        monthly_mom = add_pct_change_table(monthly_wide, "Month")  #MoM % change
 
-        results[sname] = {
-            "Daily": daily.rename(columns={room_col:"Room"}),
-            "Weekly": weekly.rename(columns={room_col:"Room"}),
-            "Monthly": monthly.rename(columns={room_col:"Room"}),
-            "Quarterly": quarterly.rename(columns={room_col:"Room"}),
-            "Yearly": yearly.rename(columns={room_col:"Room"}),
-            "Averages": averages
+        daily_long["Quarter"] = pd.to_datetime(daily_long["StudyDate"]).dt.to_period("Q")  #quarter period
+        quarterly_long = daily_long.groupby(["Room","Quarter"], as_index=False)["Volume"].sum()  #quarterly long
+        quarterly_wide = make_wide_table(quarterly_long, "Quarter", "Quarter")  #quarterly wide
+
+        daily_long["Year"] = pd.to_datetime(daily_long["StudyDate"]).dt.to_period("Y")  #year period
+        yearly_long = daily_long.groupby(["Room","Year"], as_index=False)["Volume"].sum()  #yearly long
+        yearly_wide = make_wide_table(yearly_long, "Year", "Year")  #yearly wide
+        yearly_yoy = add_pct_change_table(yearly_wide, "Year")  #YoY % change
+
+        results[sname] = {  #store tables
+            "Daily": daily_wide,
+            "Weekly": weekly_wide,
+            "Monthly": monthly_wide,
+            "Monthly_MoM_%": monthly_mom,
+            "Quarterly": quarterly_wide,
+            "Yearly": yearly_wide,
+            "Yearly_YoY_%": yearly_yoy,
         }
 
-    if not results:
-        st.error("No usable sheets. If headers aren’t on the first row, this version scans the first 10 rows—upload a sample if it still fails.")
+    if not results:  #no usable sheets
+        st.error("No usable sheets found. Ensure headers include 'Room' and 'Study Date' (any row, first 10 scanned).")
         st.stop()
 
-    #previews + charts
-    for sname, t in results.items():
-        st.header(sname)
-        st.caption("preview of daily (first 10 rows)")
-        st.dataframe(t["Daily"].head(10), use_container_width=True)
+    #-----------------------------
+    #Show tables in the app
+    #-----------------------------
+    for sname, tabs in results.items():  #display per sheet
+        st.header(sname)  #sheet name
+        st.subheader("Daily")  #daily table
+        st.dataframe(tabs["Daily"], use_container_width=True)  #show
+        st.subheader("Weekly")  #weekly table
+        st.dataframe(tabs["Weekly"], use_container_width=True)  #show
+        st.subheader("Monthly")  #monthly table
+        st.dataframe(tabs["Monthly"], use_container_width=True)  #show
+        st.subheader("Monthly (MoM % change)")  #MoM table
+        st.dataframe(tabs["Monthly_MoM_%"], use_container_width=True)  #show
+        st.subheader("Quarterly")  #quarterly table
+        st.dataframe(tabs["Quarterly"], use_container_width=True)  #show
+        st.subheader("Yearly")  #yearly table
+        st.dataframe(tabs["Yearly"], use_container_width=True)  #show
+        st.subheader("Yearly (YoY % change)")  #YoY table
+        st.dataframe(tabs["Yearly_YoY_%"], use_container_width=True)  #show
+        st.divider()  #separator
 
-        pick_opts = ["All"] + sorted(t["Daily"]["Room"].astype(str).unique().tolist())
-        pick = st.selectbox(f"select room for charts ({sname})", pick_opts, key=f"pick_{sname}")
+    #-----------------------------
+    #Append tables into the same Excel
+    #-----------------------------
+    src_bytes.seek(0)  #rewind to load workbook
+    wb = load_workbook(filename=src_bytes)  #load workbook
 
-        with st.expander("daily chart", expanded=False):
-            dfc = t["Daily"].copy()
-            dfc["StudyDate"] = pd.to_datetime(dfc["StudyDate"])
-            if pick != "All":
-                dfc = dfc[dfc["Room"].astype(str) == str(pick)]
-                pivot = dfc.pivot_table(index="StudyDate", values="Volume", aggfunc="sum").sort_index()
-            else:
-                pivot = dfc.pivot_table(index="StudyDate", columns="Room", values="Volume", aggfunc="sum").fillna(0).sort_index()
-            st.line_chart(pivot) if not pivot.empty else st.info("no daily data")
-
-        with st.expander("weekly chart", expanded=False):
-            dfc = t["Weekly"].copy()
-            dfc["WeekTS"] = _period_to_ts(dfc["Week"].astype(str), "W-MON")
-            if pick != "All":
-                dfc = dfc[dfc["Room"].astype(str) == str(pick)]
-                pivot = dfc.groupby("WeekTS")["Volume"].sum().to_frame()
-            else:
-                pivot = dfc.pivot_table(index="WeekTS", columns="Room", values="Volume", aggfunc="sum").fillna(0)
-            pivot = pivot.sort_index()
-            st.bar_chart(pivot) if not pivot.empty else st.info("no weekly data")
-
-        with st.expander("monthly chart", expanded=False):
-            dfc = t["Monthly"].copy()
-            dfc["MonthTS"] = _period_to_ts(dfc["Month"].astype(str), "M")
-            if pick != "All":
-                dfc = dfc[dfc["Room"].astype(str) == str(pick)]
-                pivot = dfc.groupby("MonthTS")["Volume"].sum().to_frame()
-            else:
-                pivot = dfc.pivot_table(index="MonthTS", columns="Room", values="Volume", aggfunc="sum").fillna(0)
-            pivot = pivot.sort_index()
-            st.bar_chart(pivot) if not pivot.empty else st.info("no monthly data")
-
-        with st.expander("quarterly chart", expanded=False):
-            dfc = t["Quarterly"].copy()
-            dfc["QuarterTS"] = _period_to_ts(dfc["Quarter"].astype(str), "Q")
-            if pick != "All":
-                dfc = dfc[dfc["Room"].astype(str) == str(pick)]
-                pivot = dfc.groupby("QuarterTS")["Volume"].sum().to_frame()
-            else:
-                pivot = dfc.pivot_table(index="QuarterTS", columns="Room", values="Volume", aggfunc="sum").fillna(0)
-            pivot = pivot.sort_index()
-            st.bar_chart(pivot) if not pivot.empty else st.info("no quarterly data")
-
-        with st.expander("yearly chart", expanded=False):
-            dfc = t["Yearly"].copy()
-            dfc["YearTS"] = _period_to_ts(dfc["Year"].astype(str), "Y")
-            if pick != "All":
-                dfc = dfc[dfc["Room"].astype(str) == str(pick)]
-                pivot = dfc.groupby("YearTS")["Volume"].sum().to_frame()
-            else:
-                pivot = dfc.pivot_table(index="YearTS", columns="Room", values="Volume", aggfunc="sum").fillna(0)
-            pivot = pivot.sort_index()
-            st.bar_chart(pivot) if not pivot.empty else st.info("no yearly data")
-
-        st.divider()
-
-    #append new sheets to same workbook
-    src_bytes.seek(0)
-    wb = load_workbook(filename=src_bytes)
-    #remove old result sheets to avoid duplicates
+    #remove prior result sheets to avoid duplicates
     for ws in list(wb.worksheets):
-        if ws.title.endswith(("_Daily","_Weekly","_Monthly","_Quarterly","_Yearly","_Averages")):
+        if ws.title.endswith(("_Daily","_Weekly","_Monthly","_Monthly_MoM_%","_Quarterly","_Yearly","_Yearly_YoY_%")):
             wb.remove(ws)
 
-    out_bytes = BytesIO()
-    with pd.ExcelWriter(out_bytes, engine="openpyxl") as writer:
-        writer.book = wb
-        writer.sheets = {ws.title: ws for ws in wb.worksheets}
-        for sheet, tables in results.items():
-            tables["Daily"].to_excel(writer, sheet_name=f"{sheet}_Daily", index=False)
-            tables["Weekly"].to_excel(writer, sheet_name=f"{sheet}_Weekly", index=False)
-            tables["Monthly"].to_excel(writer, sheet_name=f"{sheet}_Monthly", index=False)
-            tables["Quarterly"].to_excel(writer, sheet_name=f"{sheet}_Quarterly", index=False)
-            tables["Yearly"].to_excel(writer, sheet_name=f"{sheet}_Yearly", index=False)
-            tables["Averages"].to_excel(writer, sheet_name=f"{sheet}_Averages", index=False)
-        writer.book.save(out_bytes)
+    out_bytes = BytesIO()  #prepare new output buffer
+    with pd.ExcelWriter(out_bytes, engine="openpyxl") as writer:  #open writer
+        writer.book = wb  #attach existing workbook
+        writer.sheets = {ws.title: ws for ws in wb.worksheets}  #sheet map
 
-    st.download_button(
+        for sname, tabs in results.items():  #write each table as its own sheet
+            tabs["Daily"].to_excel(writer, sheet_name=f"{sname}_Daily", index=False)
+            tabs["Weekly"].to_excel(writer, sheet_name=f"{sname}_Weekly", index=False)
+            tabs["Monthly"].to_excel(writer, sheet_name=f"{sname}_Monthly", index=False)
+            tabs["Monthly_MoM_%"].to_excel(writer, sheet_name=f"{sname}_Monthly_MoM_%", index=False)
+            tabs["Quarterly"].to_excel(writer, sheet_name=f"{sname}_Quarterly", index=False)
+            tabs["Yearly"].to_excel(writer, sheet_name=f"{sname}_Yearly", index=False)
+            tabs["Yearly_YoY_%"].to_excel(writer, sheet_name=f"{sname}_Yearly_YoY_%", index=False)
+
+        writer.book.save(out_bytes)  #save workbook
+
+    st.download_button(  #download combined workbook
         label="Download Results Excel",
         data=out_bytes.getvalue(),
-        file_name=uploaded_file.name.replace(".xlsx","_with_averages.xlsx"),
+        file_name=uploaded_file.name.replace(".xlsx","_with_tables.xlsx"),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    )  #end button
 
-    st.success("Added new result sheets to your original workbook.")
+    st.success("Added Daily/Weekly/Monthly/Quarterly/Yearly tables (+MoM/YoY) to your workbook.")  #done
