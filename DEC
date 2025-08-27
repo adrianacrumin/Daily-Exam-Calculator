@@ -1,0 +1,320 @@
+# What it does
+# - Upload an Excel file with one or more sheets of exams.
+# - For EACH input sheet, it creates a NEW sheet named "<SheetName>_Averages" containing:
+#     1) Weekly table per modality with daily counts (Mon–Fri for most; Mon–Thu for US) and a weekly average.
+#     2) Monthly summary per modality with totals, scheduled days, and daily average.
+#     3) Quarterly summary per modality with totals, scheduled days, and daily average.
+#     4) Yearly summary per modality with totals, scheduled days, and daily average.
+# - Lets you download the updated Excel with all added sheets.
+#
+# Assumptions
+# - "Modality is per room" → we treat your modality/room column as the grouping key.
+# - "Study date is the day" → we use this as the date column.
+# - Workweek rules: US has 4 workdays (Mon–Thu). All other modalities have 5 workdays (Mon–Fri).
+# - Volume per row defaults to 1 if no volume column is present.
+#
+# You can customize column names and a few options in the sidebar.
+
+import re
+from io import BytesIO
+import datetime as dt
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from openpyxl import load_workbook
+
+# -----------------------------
+# UI
+# -----------------------------
+
+st.set_page_config(page_title="CPI – Modality Averages (All Sheets)", page_icon="📘", layout="wide")
+st.title("📘 Modality Daily→Weekly→Monthly→Quarterly→Yearly Calculator")
+
+with st.sidebar:
+    st.header("Column settings")
+    st.caption("Case-insensitive partial matches are OK; we also try to auto-detect.")
+    date_hint = st.text_input("Date column contains…", value="study date")
+    modality_hint = st.text_input("Modality/Room column contains…", value="modality|room")
+    volume_hint = st.text_input("Optional volume column contains…", value="count|volume|studies")
+
+    st.markdown("---")
+    st.header("Scheduling rules")
+    st.caption("US has 4 workdays (Mon–Thu). Others have 5 (Mon–Fri).")
+    us_key_regex = st.text_input("Regex for US modality key", value=r"\bUS\b", help="Used to detect the ultrasound modality/room.")
+    us_days = st.multiselect(
+        "US workdays",
+        options=["Mon", "Tue", "Wed", "Thu", "Fri"],
+        default=["Mon", "Tue", "Wed", "Thu"],
+    )
+
+    st.markdown("---")
+    st.header("Weekly calendar anchor")
+    week_ending = st.selectbox(
+        "Week ending day (affects labeling only)",
+        options=["Fri", "Thu"],
+        index=0,
+        help="Use Fri for 5-day weeks; Thu can be clearer for US 4-day weeks.",
+    )
+
+uploaded_file = st.file_uploader("Upload the Excel file", type=["xlsx"])  
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+DOW_MAP = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+
+
+def _find_col(cols: List[str], hint_regex: str) -> Optional[str]:
+    pat = re.compile(hint_regex, re.I)
+    for c in cols:
+        if pat.search(str(c).strip()):
+            return c
+    return None
+
+
+def _coerce_date(s: pd.Series) -> pd.Series:
+    d = pd.to_datetime(s, errors="coerce")
+    if hasattr(d, "dt") and d.dt.tz is not None:
+        d = d.dt.tz_convert(None)
+    return d.dt.date
+
+
+def _normalize_sheet(df: pd.DataFrame, date_hint: str, modality_hint: str, volume_hint: str) -> pd.DataFrame:
+    cols = [str(c).strip() for c in df.columns]
+    date_col = _find_col(cols, date_hint) or _find_col(cols, r"date|study\s*date|exam\s*date")
+    mod_col = _find_col(cols, modality_hint) or _find_col(cols, r"modality|room|scanner|unit")
+    vol_col = _find_col(cols, volume_hint)
+
+    if not date_col or not mod_col:
+        raise ValueError("Could not detect date/modality columns. Adjust hints in the sidebar.")
+
+    out = df.copy()
+    out["__date"] = _coerce_date(out[date_col])
+    out["__modality"] = out[mod_col].astype(str).str.strip()
+    if vol_col and vol_col in df.columns:
+        out["__volume"] = pd.to_numeric(out[vol_col], errors="coerce").fillna(0)
+    else:
+        out["__volume"] = 1
+
+    out = out.dropna(subset=["__date"])  # keep valid dates only
+    return out[["__date", "__modality", "__volume"]]
+
+
+def _workdays_for_mod(modality: str, us_regex: str, us_days_list: List[str]) -> List[int]:
+    if re.search(us_regex, modality, flags=re.I):
+        return [DOW_MAP[d] for d in us_days_list]
+    return [0, 1, 2, 3, 4]  # Mon–Fri
+
+
+def _scheduled_days(start: dt.date, end: dt.date, dows: List[int]) -> List[dt.date]:
+    rng = pd.date_range(start, end, freq="D")
+    rng = rng[rng.dayofweek.isin(dows)]
+    return list(rng.date)
+
+
+def _dense_daily(df: pd.DataFrame, us_regex: str, us_days_list: List[str]) -> pd.DataFrame:
+    # Bounds
+    start = df["__date"].min()
+    end = df["__date"].max()
+
+    # Aggregate input to daily first
+    daily = (
+        df.groupby(["__modality", "__date"], as_index=False)["__volume"].sum()
+        .rename(columns={"__modality": "modality", "__date": "date", "__volume": "volume"})
+    )
+
+    # Zero-fill to scheduled days per modality
+    filled_frames = []
+    for mod, g in daily.groupby("modality"):
+        dows = _workdays_for_mod(mod, us_regex, us_days_list)
+        sched_days = _scheduled_days(start, end, dows)
+        base = pd.DataFrame({"modality": mod, "date": sched_days})
+        filled = base.merge(g, on=["modality", "date"], how="left").fillna({"volume": 0})
+        filled_frames.append(filled)
+
+    return pd.concat(filled_frames, ignore_index=True) if filled_frames else daily
+
+
+def build_weekly_table(dense_daily: pd.DataFrame, week_ending: str, us_regex: str, us_days_list: List[str]) -> pd.DataFrame:
+    # Ensure datetime
+    df = dense_daily.copy()
+    df["date"] = pd.to_datetime(df["date"])  
+
+    # Map day names
+    df["dow"] = df["date"].dt.dayofweek  # Mon=0
+    df["day_name"] = df["date"].dt.day_name().str[:3]
+
+    # Week label
+    anchor = "W-FRI" if week_ending == "Fri" else "W-THU"
+    df["week"] = df["date"].dt.to_period(anchor).apply(lambda p: f"{p.start_time.date()} → {p.end_time.date()}")
+
+    # Pivot per modality with daily columns in order based on scheduling
+    out_frames = []
+    for mod, g in df.groupby("modality"):
+        dows = _workdays_for_mod(mod, us_regex, us_days_list)
+        day_order = ["Mon", "Tue", "Wed", "Thu"] + (["Fri"] if 4 in dows else [])
+        g = g[g["dow"].isin(dows)].copy()
+        g["day3"] = g["day_name"]
+        # Collapse to sum per day in each week
+        pw = (
+            g.pivot_table(index="week", columns="day3", values="volume", aggfunc="sum", fill_value=0)
+            .reindex(columns=day_order)
+            .reset_index()
+        )
+        # Weekly average = total / scheduled days in that week for this modality
+        scheduled_count = len(dows)
+        pw["Weekly Avg"] = pw[day_order].sum(axis=1) / scheduled_count
+        pw.insert(0, "Modality", mod)
+        out_frames.append(pw)
+
+    weekly_table = pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
+    return weekly_table
+
+
+def _period_scheduled_days(dense_daily: pd.DataFrame, freq: str, us_regex: str, us_days_list: List[str]) -> pd.DataFrame:
+    # Create a frame with number of scheduled days per modality and period
+    df = dense_daily.copy()
+    df["date"] = pd.to_datetime(df["date"])  
+    df["period"] = df["date"].dt.to_period(freq).astype(str)
+
+    rows = []
+    for mod, g in df.groupby("modality"):
+        dows = _workdays_for_mod(mod, us_regex, us_days_list)
+        # scheduled dates across the full date span of this modality
+        min_d, max_d = g["date"].min().date(), g["date"].max().date()
+        sched_dates = _scheduled_days(min_d, max_d, dows)
+        sched_df = pd.DataFrame({"date": pd.to_datetime(sched_dates)})
+        sched_df["period"] = sched_df["date"].dt.to_period(freq).astype(str)
+        cnt = sched_df.groupby("period").size().rename("scheduled_days").reset_index()
+        cnt["modality"] = mod
+        rows.append(cnt)
+
+    return pd.concat(rows, ignore_index=True)
+
+
+def build_period_summary(dense_daily: pd.DataFrame, freq: str, label: str, us_regex: str, us_days_list: List[str]) -> pd.DataFrame:
+    df = dense_daily.copy()
+    df["date"] = pd.to_datetime(df["date"])  
+    df["period"] = df["date"].dt.to_period(freq).astype(str)
+
+    totals = df.groupby(["modality", "period"], as_index=False)["volume"].sum().rename(columns={"volume": "total"})
+    sched = _period_scheduled_days(dense_daily, freq, us_regex, us_days_list)
+    merged = totals.merge(sched, on=["modality", "period"], how="left")
+    merged["avg_per_day"] = merged["total"] / merged["scheduled_days"].replace(0, np.nan)
+    merged.insert(1, "level", label)
+    return merged[["modality", "level", "period", "scheduled_days", "total", "avg_per_day"]]
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+if not uploaded_file:
+    st.info("⬅️ Upload an .xlsx to process all sheets. We'll add *_Averages sheets and let you download.")
+    st.stop()
+
+# Read entire file to a BytesIO we control for writing back
+file_bytes = BytesIO(uploaded_file.read())
+
+# Load all sheets into dict of DataFrames
+try:
+    xls = pd.ExcelFile(file_bytes)
+    sheet_names = xls.sheet_names
+except Exception as e:
+    st.error(f"Could not read workbook: {e}")
+    st.stop()
+
+# Work in pandas first, then write once
+outputs: Dict[str, Dict[str, pd.DataFrame]] = {}
+
+for sname in sheet_names:
+    try:
+        raw = pd.read_excel(file_bytes, sheet_name=sname)
+        norm = _normalize_sheet(raw, date_hint, modality_hint, volume_hint)
+        if norm.empty:
+            continue
+        dense = _dense_daily(norm, us_key_regex, us_days)
+
+        # Weekly table (daily columns + Weekly Avg)
+        weekly = build_weekly_table(dense, week_ending, us_key_regex, us_days)
+
+        # Monthly / Quarterly / Yearly summaries
+        monthly = build_period_summary(dense, freq="MS", label="Month", us_regex=us_key_regex, us_days_list=us_days)
+        quarterly = build_period_summary(dense, freq="QS", label="Quarter", us_regex=us_key_regex, us_days_list=us_days)
+        yearly = build_period_summary(dense, freq="YS", label="Year", us_regex=us_key_regex, us_days_list=us_days)
+
+        outputs[sname] = {
+            "Weekly": weekly,
+            "Monthly": monthly,
+            "Quarterly": quarterly,
+            "Yearly": yearly,
+        }
+    except Exception as e:
+        st.warning(f"Skipping sheet '{sname}': {e}")
+
+if not outputs:
+    st.error("No sheets produced output. Check column hints or data.")
+    st.stop()
+
+# Display previews in app
+for sname, parts in outputs.items():
+    st.markdown(f"## 📄 {sname}")
+    if not parts["Weekly"].empty:
+        st.subheader("Weekly (daily counts + weekly average)")
+        st.dataframe(parts["Weekly"], use_container_width=True)
+    st.subheader("Monthly / Quarterly / Yearly summaries")
+    combined = pd.concat([parts["Monthly"], parts["Quarterly"], parts["Yearly"]], ignore_index=True)
+    st.dataframe(combined, use_container_width=True)
+    st.markdown("---")
+
+# Write back to Excel (append or create *_Averages sheets)
+file_bytes.seek(0)
+wb = load_workbook(filename=file_bytes)
+
+# Remove any existing *_Averages sheets to avoid duplicates
+for ws in list(wb.worksheets):
+    if ws.title.endswith("_Averages"):
+        wb.remove(ws)
+
+with pd.ExcelWriter(file_bytes, engine="openpyxl") as writer:
+    writer.book = wb
+    writer.sheets = {ws.title: ws for ws in wb.worksheets}
+
+    for sname, parts in outputs.items():
+        out_name = f"{sname}_Averages"
+        # Build a single sheet with blocks: Weekly (top), then Monthly, Quarterly, Yearly
+        start_row = 1
+        # 1) Weekly
+        wk = parts["Weekly"].copy()
+        wk_sheet = wk if not wk.empty else pd.DataFrame({"info": ["No weekly data"]})
+        wk_sheet.to_excel(writer, sheet_name=out_name, index=False, startrow=start_row - 1)
+        start_row += len(wk_sheet) + 3
+        # 2) Monthly / Quarterly / Yearly
+        blocks = [
+            ("Monthly Summary", parts["Monthly"]),
+            ("Quarterly Summary", parts["Quarterly"]),
+            ("Yearly Summary", parts["Yearly"]),
+        ]
+        for title, dfb in blocks:
+            # Write a small title row
+            title_df = pd.DataFrame({title: []})
+            title_df.to_excel(writer, sheet_name=out_name, index=False, startrow=start_row - 1)
+            start_row += 1
+            (dfb if not dfb.empty else pd.DataFrame({"info": ["No data"]})) \
+                .to_excel(writer, sheet_name=out_name, index=False, startrow=start_row - 1)
+            start_row += (len(dfb) if not dfb.empty else 1) + 2
+
+    writer.book.save(file_bytes)
+
+# Download button for updated Excel
+st.download_button(
+    label="⬇️ Download Updated Excel (with *_Averages sheets)",
+    data=file_bytes.getvalue(),
+    file_name=re.sub(r"\.xlsx$", "_with_averages.xlsx", uploaded_file.name, flags=re.I),
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+st.success("Done. Each input sheet now has a matching *_Averages sheet with weekly + monthly/quarterly/yearly tables.")
