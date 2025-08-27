@@ -5,7 +5,7 @@ from io import BytesIO
 from openpyxl import load_workbook
 
 #-----------------------------
-#Streamlit UI
+#UI
 #-----------------------------
 st.set_page_config(page_title="CPI – Modality Tables", page_icon="page", layout="wide")
 st.title("Daily/Weekly/Monthly/Quarterly/Yearly Tables")
@@ -14,7 +14,7 @@ uploaded_file = st.file_uploader("Upload the Excel file", type=["xlsx"])
 #-----------------------------
 #Helpers
 #-----------------------------
-US_PATTERN = re.compile(r"us", re.I)  #matches any room string containing 'US' (e.g., CPIUS1)
+US_PATTERN = re.compile(r"us", re.I)  #rooms containing 'US' use 4-day weeks
 
 def _norm_text(x: str) -> str:
     s = str(x).replace("\xa0", " ").strip().lower()
@@ -35,9 +35,7 @@ def _read_sheet_robust(src_bytes: BytesIO, sheet_name: str):
     raw = pd.read_excel(src_bytes, sheet_name=sheet_name, header=None, dtype=str)
     if raw.empty:
         return None, None, None
-    hdr_idx = _sniff_header(raw, ("room", "study date"))
-    if hdr_idx is None:
-        hdr_idx = _sniff_header(raw, ("room", "study"))
+    hdr_idx = _sniff_header(raw, ("room", "study date")) or _sniff_header(raw, ("room", "study"))
     if hdr_idx is None:
         return raw, None, None
     headers = raw.iloc[hdr_idx].apply(lambda x: str(x).replace("\xa0", " ").strip())
@@ -49,12 +47,11 @@ def _read_sheet_robust(src_bytes: BytesIO, sheet_name: str):
     study_col = cols_norm.get("study date")
     if not room_col:
         for c in df.columns:
-            if "room" in _norm_text(c):
-                room_col = c; break
+            if "room" in _norm_text(c): room_col = c; break
     if not study_col:
         for c in df.columns:
             n = _norm_text(c)
-            if ("study" in n and "date" in n) or n in ("studydate", "study datetime", "study date/time"):
+            if ("study" in n and "date" in n) or n in ("studydate","study datetime","study date/time"):
                 study_col = c; break
     return df, room_col, study_col
 
@@ -80,72 +77,70 @@ def append_overall_average_row(wide_df: pd.DataFrame, period_col: str, label: st
     df = wide_df.copy()
     num_cols = [c for c in df.columns if c != period_col]
     avg_row = {period_col: label}
-    for c in num_cols:
-        avg_row[c] = df[c].mean()
+    for c in num_cols: avg_row[c] = df[c].mean()
     return pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
 
 def round_numeric(df: pd.DataFrame, digits: int = 1) -> pd.DataFrame:
     out = df.copy()
     for c in out.columns:
-        if pd.api.types.is_numeric_dtype(out[c]):
-            out[c] = out[c].round(digits)
+        if pd.api.types.is_numeric_dtype(out[c]): out[c] = out[c].round(digits)
     return out
 
 def business_days_range(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DatetimeIndex:
-    #Mon–Fri only, no weekends
-    return pd.date_range(start_date, end_date, freq="B")
+    return pd.date_range(start_date, end_date, freq="B")  #Mon–Fri only
 
 def insert_weekly_avg_rows_in_daily_strict(daily_wide: pd.DataFrame) -> pd.DataFrame:
     """
-    Insert exactly one 'Weekly Avg YYYY-MM-DD→YYYY-MM-DD' row after each Mon–Fri block.
-    - Weeks are Monday→Friday.
-    - For each room: divide that week's sum by 5 (non-US) or 4 (US).
-    - 'Total Exams' on the avg row is the sum of the per-room averages (not re-averaged).
+    Insert exactly one 'Weekly Avg YYYY-MM-DD→YYYY-MM-DD' row AFTER each complete Mon–Fri block.
+    - Weekends are excluded.
+    - Avg per room divides by 5 (or 4 if room name contains 'US').
+    - Trailing partial weeks are kept as daily rows but NO avg row is added.
     """
     df = daily_wide.copy()
-    date_col = df.columns[0]  #should be 'Date'
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    date_col = df.columns[0]  #expect 'Date'
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
     df = df.dropna(subset=[date_col])
 
-    #Ensure we have one row per business day between min/max (fills missing weekdays with zeros)
+    #fill missing weekdays with zeros across the whole span
     all_bd = business_days_range(df[date_col].min(), df[date_col].max())
     df = df.set_index(date_col).reindex(all_bd).fillna(0.0).rename_axis(date_col).reset_index()
 
-    #Compute week start (Monday) and week end (Friday) for each date
-    dow = df[date_col].dt.dayofweek  #Mon=0..Sun=6
-    week_start = df[date_col] - pd.to_timedelta(dow, unit="D")          #Monday
-    week_end = week_start + pd.to_timedelta(4, unit="D")                #Friday
+    #compute week start (Mon) and week end (Fri)
+    dow = df[date_col].dt.dayofweek  #Mon=0..Fri=4
+    week_start = df[date_col] - pd.to_timedelta(dow, unit="D")
+    week_end = week_start + pd.to_timedelta(4, unit="D")
     df["_wk_start"] = week_start
     df["_wk_end"] = week_end
 
-    #Rooms = all numeric columns except totals; keep order
+    #all numeric columns (rooms + Total Exams)
     all_cols = list(df.columns)
-    room_cols = [c for c in all_cols if c not in [date_col, "Total Exams", "_wk_start", "_wk_end"]]
+    room_cols = [c for c in all_cols if c not in [date_col, "_wk_start", "_wk_end"]]
 
     blocks = []
-    for (ws, we), g in df.groupby(["_wk_start", "_wk_end"], sort=True):
-        g2 = g.drop(columns=["_wk_start", "_wk_end"]).copy()
-
-        #Only keep Mon–Fri rows (just in case)
+    for (ws, we), g in df.groupby(["_wk_start","_wk_end"], sort=True):
+        g2 = g.drop(columns=["_wk_start","_wk_end"]).copy()
+        #keep Mon–Fri only
         g2 = g2[g2[date_col].dt.dayofweek <= 4]
-
-        #Compute per-room weekly averages using scheduled days
-        avg_row = {date_col: f"Weekly Avg {ws.date()}→{we.date()}"}
-        total_avg_sum = 0.0
-        for col in room_cols:
-            denom = scheduled_days_for_room(col)
-            val = g2[col].sum() / denom if denom else 0.0
-            avg_row[col] = val
-            total_avg_sum += val
-
-        #Total Exams on the avg row = sum of per-room averages
-        avg_row["Total Exams"] = total_avg_sum
-
-        #Append this week's rows + avg row
-        blocks.append(g2)
-        blocks.append(pd.DataFrame([avg_row]))
+        #only insert avg row for COMPLETE Mon–Fri weeks
+        if len(g2) == 5:
+            avg_row = {date_col: f"Weekly Avg {ws.date()}→{we.date()}"}
+            total_avg_sum = 0.0
+            for col in room_cols:
+                if col == "Total Exams": continue
+                denom = scheduled_days_for_room(col)
+                val = g2[col].sum() / denom if denom else 0.0
+                avg_row[col] = val
+                total_avg_sum += val
+            avg_row["Total Exams"] = total_avg_sum
+            blocks.append(g2)
+            blocks.append(pd.DataFrame([avg_row]))
+        else:
+            #partial week: just append the daily rows, no avg row
+            blocks.append(g2)
 
     out = pd.concat(blocks, ignore_index=True)
+    #format dates nicely (avoid '00:00:00')
+    out[date_col] = out[date_col].apply(lambda x: x.date() if isinstance(x, pd.Timestamp) else x)
     return out
 
 #-----------------------------
@@ -177,42 +172,42 @@ if uploaded_file:
         work["StudyDate"] = work[date_col].dt.date
 
         #Daily long
-        daily_long = work.groupby(["Room", "StudyDate"], as_index=False)["Volume"].sum()
+        daily_long = work.groupby(["Room","StudyDate"], as_index=False)["Volume"].sum()
 
-        #Daily wide + single weekly-avg row after each Mon–Fri block
+        #Daily wide + weekly avg after each COMPLETE week
         daily_wide = make_wide_table(daily_long, "StudyDate", "Date")
         daily_wide = insert_weekly_avg_rows_in_daily_strict(daily_wide)
         daily_wide = round_numeric(daily_wide, 1)
 
-        #Weekly totals (Mon-start weeks), then bottom Average row (simple mean of weekly totals)
+        #Weekly totals (Mon-start)
         daily_long["Week"] = pd.to_datetime(daily_long["StudyDate"]).dt.to_period("W-MON")
-        weekly_long = daily_long.groupby(["Room", "Week"], as_index=False)["Volume"].sum()
+        weekly_long = daily_long.groupby(["Room","Week"], as_index=False)["Volume"].sum()
         weekly_wide = make_wide_table(weekly_long, "Week", "Week")
         weekly_wide = append_overall_average_row(weekly_wide, "Week", "Average (Weekly)")
         weekly_wide = round_numeric(weekly_wide, 1)
 
         #Monthly
         daily_long["Month"] = pd.to_datetime(daily_long["StudyDate"]).dt.to_period("M")
-        monthly_long = daily_long.groupby(["Room", "Month"], as_index=False)["Volume"].sum()
+        monthly_long = daily_long.groupby(["Room","Month"], as_index=False)["Volume"].sum()
         monthly_wide = make_wide_table(monthly_long, "Month", "Month")
         monthly_wide = append_overall_average_row(monthly_wide, "Month", "Average (Monthly)")
         monthly_wide = round_numeric(monthly_wide, 1)
-        monthly_mom = add_pct_change_table(monthly_wide.drop(monthly_wide.index[-1]), "Month")  #exclude Average row
+        monthly_mom = add_pct_change_table(monthly_wide.drop(monthly_wide.index[-1]), "Month")
 
         #Quarterly
         daily_long["Quarter"] = pd.to_datetime(daily_long["StudyDate"]).dt.to_period("Q")
-        quarterly_long = daily_long.groupby(["Room", "Quarter"], as_index=False)["Volume"].sum()
+        quarterly_long = daily_long.groupby(["Room","Quarter"], as_index=False)["Volume"].sum()
         quarterly_wide = make_wide_table(quarterly_long, "Quarter", "Quarter")
         quarterly_wide = append_overall_average_row(quarterly_wide, "Quarter", "Average (Quarterly)")
         quarterly_wide = round_numeric(quarterly_wide, 1)
 
         #Yearly
         daily_long["Year"] = pd.to_datetime(daily_long["StudyDate"]).dt.to_period("Y")
-        yearly_long = daily_long.groupby(["Room", "Year"], as_index=False)["Volume"].sum()
+        yearly_long = daily_long.groupby(["Room","Year"], as_index=False)["Volume"].sum()
         yearly_wide = make_wide_table(yearly_long, "Year", "Year")
         yearly_wide = append_overall_average_row(yearly_wide, "Year", "Average (Yearly)")
         yearly_wide = round_numeric(yearly_wide, 1)
-        yearly_yoy = add_pct_change_table(yearly_wide.drop(yearly_wide.index[-1]), "Year")  #exclude Average row
+        yearly_yoy = add_pct_change_table(yearly_wide.drop(yearly_wide.index[-1]), "Year")
 
         results[sname] = {
             "Daily": daily_wide,
@@ -225,13 +220,13 @@ if uploaded_file:
         }
 
     if not results:
-        st.error("No usable sheets found. Ensure headers include 'Room' and 'Study Date' (we scan first 10 rows).")
+        st.error("No usable sheets found. Ensure headers include 'Room' and 'Study Date' (we scan the first 10 rows).")
         st.stop()
 
-    #Show tables in the app
+    #Show the tables
     for sname, tabs in results.items():
         st.header(sname)
-        st.subheader("Daily (with Weekly Avg rows)")
+        st.subheader("Daily (with Weekly Avg rows; Mon–Fri complete weeks only)")
         st.dataframe(tabs["Daily"], use_container_width=True)
         st.subheader("Weekly (with bottom Average)")
         st.dataframe(tabs["Weekly"], use_container_width=True)
@@ -247,11 +242,9 @@ if uploaded_file:
         st.dataframe(tabs["Yearly_YoY_%"], use_container_width=True)
         st.divider()
 
-    #Append tables back into the uploaded workbook
+    #Append to original workbook
     src_bytes.seek(0)
     wb = load_workbook(filename=src_bytes)
-
-    #Remove prior result sheets to avoid duplicates
     for ws in list(wb.worksheets):
         if ws.title.endswith(("_Daily","_Weekly","_Monthly","_Monthly_MoM_%","_Quarterly","_Yearly","_Yearly_YoY_%")):
             wb.remove(ws)
@@ -277,4 +270,4 @@ if uploaded_file:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    st.success("Added Daily/Weekly/Monthly/Quarterly/Yearly tables (+Weekly Avg rows using 5-day vs 4-day US logic, +MoM/YoY) to your workbook.")
+    st.success("Tables updated. Weekly Avg rows only for complete Mon–Fri weeks; US rooms averaged over 4 days, others over 5.")
